@@ -1,0 +1,318 @@
+// routes/transactions.js
+
+import express from "express";
+import Transaction from "../Models/Transaction.js";
+import Book from "../Models/Book.js";
+import User from "../Models/User.js";
+
+const router = express.Router();
+
+/**
+ * @route   POST /api/transactions/issue
+ * @desc    Issue a book to a user
+ * @body    { bookName: String, userId: String, issueDate: Date (optional) }
+ * @access  Public
+ */
+router.post("/issue", async (req, res) => {
+  try {
+    const { bookName, userId, issueDate } = req.body;
+
+    // Validate input
+    if (!bookName || !userId) {
+      return res
+        .status(400)
+        .json({ message: "Book name and User ID are required." });
+    }
+
+    // Check if user exists
+    const user = await User.findById(userId);
+    if (!user) {
+      return res.status(404).json({ message: "User not found." });
+    }
+
+    // Check if book exists and is available
+    const book = await Book.findOne({ name: bookName });
+    if (!book) {
+      return res.status(404).json({ message: "Book not found." });
+    }
+
+    if (!book.available) {
+      return res
+        .status(400)
+        .json({ message: "Book is currently not available for issue." });
+    }
+
+    // Create a new transaction
+    const transaction = new Transaction({
+      book: book._id,
+      user: user._id,
+      issueDate: issueDate || Date.now(),
+      status: "issued",
+    });
+
+    await transaction.save();
+
+    // Update book availability
+    book.available = false;
+    await book.save();
+
+    res.status(201).json({ message: "Book issued successfully.", transaction });
+  } catch (error) {
+    console.error("Error issuing book:", error);
+    res.status(500).json({ message: "Server Error" });
+  }
+});
+
+router.post("/return", async (req, res) => {
+  try {
+    const { bookName, userId, returnDate } = req.body;
+
+    // Validate input
+    if (!bookName || !userId) {
+      return res
+        .status(400)
+        .json({ message: "Book name and User ID are required." });
+    }
+
+    // Check if user exists
+    const user = await User.findById(userId);
+    if (!user) {
+      return res.status(404).json({ message: "User not found." });
+    }
+
+    // Check if book exists
+    const book = await Book.findOne({ name: bookName });
+    if (!book) {
+      return res.status(404).json({ message: "Book not found." });
+    }
+
+    // Find the active transaction
+    const transaction = await Transaction.findOne({
+      book: book._id,
+      user: user._id,
+      status: "issued",
+    });
+
+    if (!transaction) {
+      return res.status(404).json({
+        message: "No active transaction found for this book and user.",
+      });
+    }
+
+    // Set return date
+    transaction.returnDate = returnDate || Date.now();
+
+    // Calculate number of days rented
+    const issueDate = new Date(transaction.issueDate);
+    const returnDt = new Date(transaction.returnDate);
+    const diffTime = Math.abs(returnDt - issueDate);
+    const diffDays = Math.ceil(diffTime / (1000 * 60 * 60 * 24));
+
+    // Calculate rent
+    transaction.rent = diffDays * book.rentPerDay;
+    transaction.status = "returned";
+
+    await transaction.save();
+
+    // Update book availability
+    book.available = true;
+    await book.save();
+
+    res.status(200).json({
+      message: "Book returned successfully.",
+      rent: transaction.rent,
+      transaction,
+    });
+  } catch (error) {
+    console.error("Error returning book:", error);
+    res.status(500).json({ message: "Server Error" });
+  }
+});
+
+/**
+ * @route   GET /api/transactions/book/:bookName
+ * @desc    Get transaction details for a specific book
+ * @param   bookName - Name of the book
+ * @access  Public
+ */
+router.get("/book/:bookName", async (req, res) => {
+  try {
+    const { bookName } = req.params;
+
+    // Find the book by name
+    const book = await Book.findOne({ name: bookName });
+    if (!book) {
+      return res.status(404).json({ message: "Book not found." });
+    }
+
+    // Find all transactions for this book
+    const transactions = await Transaction.find({ book: book._id }).populate(
+      "user",
+      "username email"
+    );
+
+    // Total count of past issuances
+    const totalCount = transactions.length;
+
+    // Find the current issuer if any
+    const currentTransaction = await Transaction.findOne({
+      book: book._id,
+      status: "issued",
+    }).populate("user", "username email");
+
+    if (currentTransaction) {
+      return res.json({
+        book: book.name,
+        totalIssuances: totalCount,
+        currentIssuer: currentTransaction.user,
+        status: "Issued",
+      });
+    } else {
+      return res.json({
+        book: book.name,
+        totalIssuances: totalCount,
+        currentIssuer: null,
+        status: "Not Issued",
+      });
+    }
+  } catch (error) {
+    console.error("Error fetching transactions by book name:", error);
+    res.status(500).json({ message: "Server Error" });
+  }
+});
+
+/**
+ * @route   GET /api/transactions/book/:bookName/rent
+ * @desc    Get total rent generated by a specific book
+ * @param   bookName - Name of the book
+ * @access  Public
+ */
+router.get("/book/:bookName/rent", async (req, res) => {
+  try {
+    const { bookName } = req.params;
+
+    // Find the book by name
+    const book = await Book.findOne({ name: bookName });
+    if (!book) {
+      return res.status(404).json({ message: "Book not found." });
+    }
+
+    // Aggregate total rent from all returned transactions for this book
+    const totalRentResult = await Transaction.aggregate([
+      { $match: { book: book._id, status: "returned" } },
+      {
+        $group: {
+          _id: "$book",
+          totalRent: { $sum: "$rent" },
+          totalLateFees: { $sum: "$lateFee" },
+        },
+      },
+    ]);
+
+    const totalRent = totalRentResult[0]?.totalRent || 0;
+    const totalLateFees = totalRentResult[0]?.totalLateFees || 0;
+
+    res.json({
+      book: book.name,
+      totalRentGenerated: totalRent,
+      totalLateFeesGenerated: totalLateFees,
+    });
+  } catch (error) {
+    console.error("Error fetching total rent for book:", error);
+    res.status(500).json({ message: "Server Error" });
+  }
+});
+
+/**
+ * @route   GET /api/transactions/user/:userId
+ * @desc    Get list of books issued to a specific user
+ * @param   userId - ID of the user
+ * @access  Public
+ */
+router.get("/user/:userId", async (req, res) => {
+  try {
+    const { userId } = req.params;
+
+    // Validate user existence
+    const user = await User.findById(userId);
+    if (!user) {
+      return res.status(404).json({ message: "User not found." });
+    }
+
+    // Find all transactions for this user
+    const transactions = await Transaction.find({ user: user._id }).populate(
+      "book",
+      "name category"
+    );
+
+    res.json({
+      user: user.username,
+      booksIssued: transactions.map((tx) => ({
+        bookName: tx.book.name,
+        category: tx.book.category,
+        issueDate: tx.issueDate,
+        returnDate: tx.returnDate,
+        status: tx.status,
+      })),
+    });
+  } catch (error) {
+    console.error("Error fetching transactions by user:", error);
+    res.status(500).json({ message: "Server Error" });
+  }
+});
+
+/**
+ * @route   GET /api/transactions/date
+ * @desc    Get list of books issued within a date range and the users who issued them
+ * @query   start - Start date (YYYY-MM-DD)
+ *          end - End date (YYYY-MM-DD)
+ * @access  Public
+ */
+router.get("/date", async (req, res) => {
+  try {
+    const { start, end } = req.query;
+
+    // Validate date inputs
+    if (!start || !end) {
+      return res
+        .status(400)
+        .json({ message: "Start and end dates are required." });
+    }
+
+    const startDate = new Date(start);
+    const endDate = new Date(end);
+
+    if (isNaN(startDate) || isNaN(endDate)) {
+      return res
+        .status(400)
+        .json({ message: "Invalid date format. Use YYYY-MM-DD." });
+    }
+
+    // Find all transactions within the date range based on issueDate
+    const transactions = await Transaction.find({
+      issueDate: { $gte: startDate, $lte: endDate },
+    })
+      .populate("user", "username email")
+      .populate("book", "name category");
+
+    const formattedTransactions = transactions.map((tx) => ({
+      bookName: tx.book.name,
+      category: tx.book.category,
+      user: tx.user.username,
+      issueDate: tx.issueDate,
+      returnDate: tx.returnDate,
+      status: tx.status,
+    }));
+
+    res.json({
+      startDate: startDate.toISOString(),
+      endDate: endDate.toISOString(),
+      transactions: formattedTransactions,
+    });
+  } catch (error) {
+    console.error("Error fetching transactions by date range:", error);
+    res.status(500).json({ message: "Server Error" });
+  }
+});
+
+export default router;
